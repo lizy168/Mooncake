@@ -9,9 +9,9 @@
 #include <thread>
 #include <vector>
 
-#include <mooncake_worker.cuh>
+#include <pg_core_store.h>
+#include <pg_core_types.h>
 #include <p2p_proxy.h>
-#include <torch/torch.h>
 #include <transfer_engine.h>
 
 namespace mooncake {
@@ -76,9 +76,9 @@ class ConnectionContext {
     std::atomic<int> establishedGroupSize_;
 
     uint64_t* local2global_rank_map_;
-    c10::intrusive_ptr<::c10d::Store> store_;
+    std::shared_ptr<CoreStore> store_;
 
-    std::shared_ptr<TransferGroupMeta> meta_;
+    std::shared_ptr<P2PConnectionMetadata> meta_;
     std::shared_ptr<P2PProxy> p2p_proxy_;
     TransferEngine* engine_;
 
@@ -104,8 +104,8 @@ class ConnectionContext {
    public:
     ConnectionContext(int backendIndex, int rank, int size, bool isDummy,
                       uint64_t* local2global_rank_map,
-                      c10::intrusive_ptr<::c10d::Store> store,
-                      std::shared_ptr<TransferGroupMeta> meta,
+                      std::shared_ptr<CoreStore> store,
+                      std::shared_ptr<P2PConnectionMetadata> meta,
                       std::shared_ptr<P2PProxy> p2p_proxy,
                       TransferEngine* engine);
     ~ConnectionContext();

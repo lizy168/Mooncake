@@ -16,13 +16,6 @@ enum WorkerTaskStatus {
 
 static constexpr size_t kInvalidTaskId = static_cast<size_t>(-1);
 
-static void setActiveRanksTensorValue(TransferGroupMeta* group, int rank,
-                                      int value) {
-    if (group->activeRanksTensor.device().is_cpu()) {
-        group->activeRanksTensor[rank] = value;
-    }
-}
-
 void MooncakeWorker::Start() {
     bool expected = false;
     if (started_.compare_exchange_strong(expected, true)) {
@@ -91,13 +84,15 @@ void MooncakeWorker::startWorker() {
                     continue;
                 }
 
-                auto group = (TransferGroupMeta*)task.transferGroupMeta;
+                auto group =
+                    static_cast<P2PConnectionMetadata*>(task.transferGroupMeta);
+                const auto op = task.op;
                 bool skipTransfer =
-                    ((c10d::OpType)task.opType == c10d::OpType::BROADCAST &&
+                    (op == CollectiveOp::kBroadcast &&
                      group->rank != task.broadcastRoot) ||
-                    ((c10d::OpType)task.opType == c10d::OpType::SCATTER &&
+                    (op == CollectiveOp::kScatter &&
                      group->rank != task.broadcastRoot) ||
-                    (c10d::OpType)task.opType == c10d::OpType::BARRIER;
+                    op == CollectiveOp::kBarrier;
                 if (task_status[i].load(std::memory_order_acquire) == IDLE) {
                     const auto submit_sequence = task.submitSequence;
                     if (skipTransfer) {
@@ -115,28 +110,24 @@ void MooncakeWorker::startWorker() {
                         if (!group->activeRanks[j]) {
                             continue;
                         }
-                        if (((c10d::OpType)task.opType ==
-                                 c10d::OpType::GATHER ||
-                             (c10d::OpType)task.opType ==
-                                 c10d::OpType::REDUCE) &&
+                        if ((op == CollectiveOp::kGather ||
+                             op == CollectiveOp::kReduce) &&
                             j != task.broadcastRoot) {
                             continue;
                         }
                         uint64_t source = group->segmentInfos[group->rank]
                                               .send_buffer[task.bufferOffset];
 
-                        switch ((c10d::OpType)task.opType) {
-                            case c10d::OpType::BROADCAST:
-                            case c10d::OpType::ALLREDUCE:
-                            case c10d::OpType::ALLGATHER:
-                            case c10d::OpType::_ALLGATHER_BASE:
-                            case c10d::OpType::REDUCE:
-                            case c10d::OpType::GATHER:
+                        switch (op) {
+                            case CollectiveOp::kBroadcast:
+                            case CollectiveOp::kAllReduce:
+                            case CollectiveOp::kAllGather:
+                            case CollectiveOp::kReduce:
+                            case CollectiveOp::kGather:
                                 break;
-                            case c10d::OpType::ALLTOALL_BASE:
-                            case c10d::OpType::ALLTOALL:
-                            case c10d::OpType::_REDUCE_SCATTER_BASE:
-                            case c10d::OpType::SCATTER:
+                            case CollectiveOp::kAllToAll:
+                            case CollectiveOp::kReduceScatter:
+                            case CollectiveOp::kScatter:
                                 source += j * task.tensorSize;
                                 break;
                             default:
@@ -146,18 +137,16 @@ void MooncakeWorker::startWorker() {
                             group->segmentInfos[j]
                                 .recv_buffer[task.bufferOffset];
 
-                        switch ((c10d::OpType)task.opType) {
-                            case c10d::OpType::BROADCAST:
-                            case c10d::OpType::SCATTER:
+                        switch (op) {
+                            case CollectiveOp::kBroadcast:
+                            case CollectiveOp::kScatter:
                                 break;
-                            case c10d::OpType::ALLREDUCE:
-                            case c10d::OpType::ALLGATHER:
-                            case c10d::OpType::_ALLGATHER_BASE:
-                            case c10d::OpType::ALLTOALL_BASE:
-                            case c10d::OpType::ALLTOALL:
-                            case c10d::OpType::_REDUCE_SCATTER_BASE:
-                            case c10d::OpType::REDUCE:
-                            case c10d::OpType::GATHER:
+                            case CollectiveOp::kAllReduce:
+                            case CollectiveOp::kAllGather:
+                            case CollectiveOp::kAllToAll:
+                            case CollectiveOp::kReduceScatter:
+                            case CollectiveOp::kReduce:
+                            case CollectiveOp::kGather:
                                 target_offset += group->rank * task.tensorSize;
                                 break;
 
@@ -210,13 +199,15 @@ void MooncakeWorker::startWorker() {
                                         << "Rank " << group->rank
                                         << " marking peer " << j
                                         << " as broken during transferring op "
-                                        << (int)task.opType;
+                                        << static_cast<int>(task.op);
 
                                     // Set peerConnected to notify the
                                     // connection poller to reconnect it.
                                     group->peerConnected[j] = false;
                                     group->activeRanks[j] = false;
-                                    setActiveRanksTensorValue(group, j, 0);
+                                    if (group->onPeerBroken) {
+                                        group->onPeerBroken(j);
+                                    }
                                 } else {
                                     batch_done = false;
                                     break;
@@ -299,13 +290,15 @@ void MooncakeWorker::startWorker() {
                                 LOG(ERROR) << "Rank " << group->rank
                                            << " marking peer " << j
                                            << " as broken during syncing op "
-                                           << (int)task.opType;
+                                           << static_cast<int>(task.op);
 
                                 // Set peerConnected to notify the
                                 // connection poller to reconnect it.
                                 group->peerConnected[j] = false;
                                 group->activeRanks[j] = false;
-                                setActiveRanksTensorValue(group, j, 0);
+                                if (group->onPeerBroken) {
+                                    group->onPeerBroken(j);
+                                }
                             } else {
                                 task_done = false;
                                 break;

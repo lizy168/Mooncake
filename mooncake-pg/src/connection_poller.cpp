@@ -1,17 +1,17 @@
-#include <c10/util/Exception.h>
 #include <connection_poller.h>
 #include <cuda_alike.h>
-#include <torch/torch.h>
+#if !defined(MOONCAKE_EP_USE_MUSA) && !defined(USE_MACA)
+#include <cuda.h>
+#endif
 #include <atomic>
 #include <chrono>
 #include <mutex>
 #include <thread>
-#include <torch/csrc/distributed/c10d/Backend.hpp>
 #include <algorithm>
 #include <cstring>
 #include <limits>
 #include "memory_location.h"
-#include "mooncake_worker.cuh"
+#include "pg_core_check.h"
 #include "pg_utils.h"
 
 namespace mooncake {
@@ -46,8 +46,8 @@ static bool supportFabricMem() { return false; }
 ConnectionContext::ConnectionContext(int backendIndex, int rank, int size,
                                      bool isDummy,
                                      uint64_t* local2global_rank_map,
-                                     c10::intrusive_ptr<::c10d::Store> store,
-                                     std::shared_ptr<TransferGroupMeta> meta,
+                                     std::shared_ptr<CoreStore> store,
+                                     std::shared_ptr<P2PConnectionMetadata> meta,
                                      std::shared_ptr<P2PProxy> p2p_proxy,
                                      TransferEngine* engine)
     : backendIndex_(backendIndex),
@@ -75,12 +75,12 @@ ConnectionContext::ConnectionContext(int backendIndex, int rank, int size,
     warmup_send_region_[0] = 1;
     int rc = engine_->registerLocalMemory(
         warmup_send_region_, kMaxNumRanks * sizeof(int32_t), kWildcardLocation);
-    TORCH_CHECK(!rc, "Failed to register local memory for context.");
+    MOONCAKE_CORE_CHECK(!rc, "Failed to register local memory for context.");
 
     warmup_recv_region_ = new int32_t[kMaxNumRanks]{};
     rc = engine_->registerLocalMemory(
         warmup_recv_region_, kMaxNumRanks * sizeof(int32_t), kWildcardLocation);
-    TORCH_CHECK(!rc, "Failed to register local memory for context.");
+    MOONCAKE_CORE_CHECK(!rc, "Failed to register local memory for context.");
 }
 
 ConnectionContext::~ConnectionContext() {
@@ -114,10 +114,10 @@ void ConnectionContext::extendGroupSizeTo(int newGroupSize) {
     const int oldGroupSize = groupSize_.load(std::memory_order_acquire);
     if (newGroupSize == oldGroupSize) return;
 
-    TORCH_CHECK(
+    MOONCAKE_CORE_CHECK(
         newGroupSize >= 0 && static_cast<size_t>(newGroupSize) < kMaxNumRanks,
         "Size out of range");
-    TORCH_CHECK(newGroupSize >= oldGroupSize, "newGroupSize < oldGroupSize");
+    MOONCAKE_CORE_CHECK(newGroupSize >= oldGroupSize, "newGroupSize < oldGroupSize");
 
     // Reset local peer state for newly added ranks
     for (int i = oldGroupSize; i < newGroupSize; ++i) {
@@ -131,9 +131,9 @@ void ConnectionContext::extendGroupSizeTo(int newGroupSize) {
 
 void ConnectionContext::setPollingLimitTo(int pollingLimit) {
     const int groupSize = groupSize_.load(std::memory_order_acquire);
-    TORCH_CHECK(pollingLimit >= groupSize,
+    MOONCAKE_CORE_CHECK(pollingLimit >= groupSize,
                 "pollingLimit must be >= current groupSize");
-    TORCH_CHECK(
+    MOONCAKE_CORE_CHECK(
         pollingLimit >= 0 && static_cast<size_t>(pollingLimit) < kMaxNumRanks,
         "Size out of range");
     pollingLimit_.store(pollingLimit, std::memory_order_release);
@@ -266,7 +266,7 @@ bool ConnectionContext::pollPeer(int pollingRank) {
                     peerState.increaseCheckStoreBackoff();
                     return false;
                 }
-                peerServerName = store_->get_to_str(serverNameKey);
+                peerServerName = store_->getString(serverNameKey);
                 buffer_data = store_->get(bufferKey);
 
                 if (buffer_data.size() < sizeof(SegmentInfo)) {
@@ -433,9 +433,7 @@ bool ConnectionContext::pollPeer(int pollingRank) {
             global_peerConnected_[globalPollingRank] = false;
             meta_->peerConnected[pollingRank] = false;
             meta_->activeRanks[pollingRank] = false;
-            if (meta_->activeRanksTensor.device().is_cpu()) {
-                meta_->activeRanksTensor[pollingRank] = 0;
-            }
+            if (meta_->onPeerBroken) meta_->onPeerBroken(pollingRank);
 
             // Reset store
             try {
@@ -473,7 +471,7 @@ bool ConnectionContext::pollPeer(int pollingRank) {
         }
 
         case PeerConnectionState::EXPIRING:
-            TORCH_CHECK(
+            MOONCAKE_CORE_CHECK(
                 false, "Unexpected PeerConnectionState::EXPIRING in pollPeer.");
             break;
     }
@@ -551,7 +549,7 @@ void ConnectionPoller::registerContext(
 
 void ConnectionPoller::removeContext(
     const std::shared_ptr<ConnectionContext>& ctx) {
-    TORCH_CHECK(ctx->isShutdown_, "connection context hasn't shutdown.");
+    MOONCAKE_CORE_CHECK(ctx->isShutdown_, "connection context hasn't shutdown.");
 
     {
         std::lock_guard<std::mutex> lock(contexts_mutex_);

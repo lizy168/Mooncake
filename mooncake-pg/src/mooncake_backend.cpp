@@ -17,6 +17,38 @@
 namespace mooncake {
 namespace {
 
+class TorchCoreStore final : public CoreStore {
+   public:
+    explicit TorchCoreStore(c10::intrusive_ptr<::c10d::Store> store)
+        : store_(std::move(store)) {}
+
+    bool check(const std::vector<std::string>& keys) override {
+        return store_->check(keys);
+    }
+
+    std::vector<uint8_t> get(const std::string& key) override {
+        return store_->get(key);
+    }
+
+    std::string getString(const std::string& key) override {
+        return store_->get_to_str(key);
+    }
+
+    void set(const std::string& key,
+             const std::vector<uint8_t>& value) override {
+        store_->set(key, value);
+    }
+
+    void set(const std::string& key, const std::string& value) override {
+        store_->set(key, value);
+    }
+
+    void deleteKey(const std::string& key) override { store_->deleteKey(key); }
+
+   private:
+    c10::intrusive_ptr<::c10d::Store> store_;
+};
+
 #ifdef USE_MACA
 static void requireMacaHostTransport() {
     TORCH_CHECK(std::getenv("MC_MACA_HOST_TRANSPORT") != nullptr,
@@ -362,7 +394,8 @@ MooncakeBackend::MooncakeBackend(
     meta_ = std::make_shared<TransferGroupMeta>();
     connection_ctx_ = std::make_shared<ConnectionContext>(
         backendIndex_, rank, size, options_ && options_->isExtension_,
-        local2global_rank_map_, store, meta_, p2p_proxy_, engine_);
+        local2global_rank_map_, std::make_shared<TorchCoreStore>(store), meta_,
+        p2p_proxy_, engine_);
 
     if (max_size != size) {
         connection_ctx_->setPollingLimitTo(max_size);
@@ -445,6 +478,11 @@ MooncakeBackend::MooncakeBackend(
     meta_->store = store;
     meta_->backendIndex = backendIndex_;
     meta_->bufferBaseIndex = backendIndex_ * 10;
+    meta_->onPeerBroken = [meta = meta_](int peer_rank) {
+        if (meta->activeRanksTensor.device().is_cpu()) {
+            meta->activeRanksTensor[peer_rank] = 0;
+        }
+    };
     p2p_proxy_->bindMeta(meta_);
 
     connection_ctx_->bootstrapLocalPeer(localServerName_, rank_info);
@@ -517,6 +555,12 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::send(
                 "P2P send: dstRank out of range.");
 
     auto contiguous = tensor.contiguous();
+    const RawBuffer buffer{
+        .data = contiguous.data_ptr(),
+        .bytes = static_cast<uint64_t>(contiguous.nbytes()),
+    };
+    std::shared_ptr<void> keepalive =
+        std::make_shared<at::Tensor>(std::move(contiguous));
     auto status = std::make_shared<std::atomic<P2PProxy::OpStatus>>(
         P2PProxy::OpStatus::kPending);
     cudaStream_t stream = nullptr;
@@ -528,10 +572,11 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::send(
 
     TORCH_CHECK(p2p_proxy_, "P2P send proxy is not initialized.");
     p2p_proxy_->enqueueSend(P2PProxy::SendOp{
-        .tensor_ = std::move(contiguous),
+        .buffer_ = buffer,
         .peer_rank_ = dstRank,
         .cuda_stream_ = stream,
         .status_ = status,
+        .keepalive_ = std::move(keepalive),
     });
 
     return c10::make_intrusive<MooncakeP2PWork>(status);
@@ -550,6 +595,11 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::recv(
                 "P2P recv: srcRank out of range.");
 
     auto target = tensor.is_contiguous() ? tensor : tensor.contiguous();
+    const RawBuffer buffer{
+        .data = target.data_ptr(),
+        .bytes = static_cast<uint64_t>(target.nbytes()),
+    };
+    std::shared_ptr<void> keepalive = std::make_shared<at::Tensor>(target);
     auto status = std::make_shared<std::atomic<P2PProxy::OpStatus>>(
         P2PProxy::OpStatus::kPending);
     cudaStream_t stream = nullptr;
@@ -561,11 +611,23 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::recv(
 
     TORCH_CHECK(p2p_proxy_, "P2P recv proxy is not initialized.");
     p2p_proxy_->enqueueRecv(P2PProxy::RecvOp{
-        .tensor_ = target,
-        .original_tensor_ = tensor,
+        .buffer_ = buffer,
         .peer_rank_ = srcRank,
         .cuda_stream_ = stream,
         .status_ = status,
+        .keepalive_ = std::move(keepalive),
+        .completion_callback_ = [target, tensor, is_cpu = isCpu_]() mutable {
+            if (!tensor.is_contiguous()) {
+                (void)tensor.copy_(target);
+                if (!is_cpu) {
+                    const cudaError_t sync_error = cudaDeviceSynchronize();
+                    TORCH_CHECK(sync_error == cudaSuccess,
+                                "P2P recv final copy cudaDeviceSynchronize "
+                                "failed: ",
+                                cudaGetErrorString(sync_error));
+                }
+            }
+        },
     });
 
     return c10::make_intrusive<MooncakeP2PWork>(status);

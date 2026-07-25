@@ -1,8 +1,13 @@
 #ifndef MOONCAKE_P2P_PROXY_H
 #define MOONCAKE_P2P_PROXY_H
 
-#include <mooncake_worker.cuh>
-#include <torch/torch.h>
+#include <pg_core_types.h>
+#if defined(USE_HIP) || defined(USE_MUSA) || defined(USE_MLU) || \
+    defined(USE_UBSHMEM) || defined(USE_MACA) || defined(USE_SUNRISE)
+#include <cuda_alike.h>
+#else
+#include <cuda_runtime.h>
+#endif
 #include <array>
 #include <atomic>
 #include <condition_variable>
@@ -285,18 +290,20 @@ class P2PProxy {
     };
 
     struct SendOp {
-        at::Tensor tensor_;
+        RawBuffer buffer_;
         int peer_rank_ = -1;
         cudaStream_t cuda_stream_ = nullptr;
         std::shared_ptr<std::atomic<OpStatus>> status_;
+        std::shared_ptr<void> keepalive_;
     };
 
     struct RecvOp {
-        at::Tensor tensor_;
-        at::Tensor original_tensor_;
+        RawBuffer buffer_;
         int peer_rank_ = -1;
         cudaStream_t cuda_stream_ = nullptr;
         std::shared_ptr<std::atomic<OpStatus>> status_;
+        std::shared_ptr<void> keepalive_;
+        std::function<void()> completion_callback_;
     };
 
     P2PProxy(TransferEngine* engine, const Options& options);
@@ -304,7 +311,7 @@ class P2PProxy {
 
     CreditSlot* credit_region() const { return resources_.credit_region_; }
     AckSlot* ack_region() const { return resources_.ack_region_; }
-    void bindMeta(const std::shared_ptr<TransferGroupMeta>& meta);
+    void bindMeta(const std::shared_ptr<P2PConnectionMetadata>& meta);
     void extendGroupSizeTo(int new_size);
 
     void enqueueSend(SendOp op);
@@ -397,7 +404,8 @@ class P2PProxy {
         std::deque<SendTransferTask> tasks_;
         std::shared_ptr<std::atomic<OpStatus>> status_;
 
-        at::Tensor tensor_;
+        RawBuffer buffer_;
+        std::shared_ptr<void> keepalive_;
         int peer_rank_ = -1;
         cudaStream_t cuda_stream_ = nullptr;
         uint64_t total_bytes_ = 0;
@@ -442,8 +450,9 @@ class P2PProxy {
         std::deque<RecvTransferTask> tasks_;
         std::shared_ptr<std::atomic<OpStatus>> status_;
 
-        at::Tensor tensor_;
-        at::Tensor original_tensor_;
+        RawBuffer buffer_;
+        std::shared_ptr<void> keepalive_;
+        std::function<void()> completion_callback_;
         int peer_rank_ = -1;
         cudaStream_t cuda_stream_ = nullptr;
         uint64_t total_bytes_ = 0;
@@ -554,7 +563,7 @@ class P2PProxy {
     P2PDeviceWorker* device_worker_ = nullptr;
 
     TransferEngine* engine_ = nullptr;
-    std::shared_ptr<TransferGroupMeta> meta_;
+    std::shared_ptr<P2PConnectionMetadata> meta_;
     bool is_cpu_ = false;
     int rank_ = 0;
     int size_ = 0;

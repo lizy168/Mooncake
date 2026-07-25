@@ -111,6 +111,7 @@ setup(
                 "src/mooncake_worker_host.cpp",
                 "src/mooncake_worker_thread.cpp",
                 "src/connection_poller.cpp",
+                "src/collective_reduce.cpp",
             ],
             extra_compile_args={"cxx": cxx_args, "nvcc": device_args},
             libraries=cuda_libraries,

@@ -178,6 +178,10 @@ endif()
 
 add_subdirectory(mooncake-integration)
 
+# pg_core links against the Python engine module, which is defined by the
+# integration target above.
+add_subdirectory(mooncake-pg/core)
+
 if (WITH_STORE_GO AND WITH_STORE)
   add_custom_target(build_store_go DEPENDS mooncake_store transfer_engine)
   add_custom_command(

@@ -3,10 +3,15 @@
 // The __MUSA__ branch avoids torch headers to stay compatible with mcc.
 
 #include <mooncake_worker_kernels.cuh>
+#include <pg_core_check.h>
 
 #ifdef __MUSA__
 #include <musa_bf16.h>
+#else
+#include <cuda_bf16.h>
 #endif
+
+#include <type_traits>
 
 namespace mooncake {
 
@@ -15,6 +20,24 @@ namespace mooncake {
 // C++ types (int instead of c10d::OpType / c10d::ReduceOp::RedOpType)
 // so that mcc can compile them without torch headers.
 
+#ifdef __MUSA__
+__device__ float bfloat16ToFloat(mt_bfloat16 value) {
+    return static_cast<float>(value);
+}
+
+__device__ mt_bfloat16 floatToBfloat16(float value) {
+    return static_cast<mt_bfloat16>(value);
+}
+#else
+__device__ float bfloat16ToFloat(__nv_bfloat16 value) {
+    return __bfloat162float(value);
+}
+
+__device__ __nv_bfloat16 floatToBfloat16(float value) {
+    return __float2bfloat16(value);
+}
+#endif
+
 __global__ void enqueueTaskKernel(int opType, size_t tensorSize,
                                   int64_t broadcastRoot, int bufferOffset,
                                   uint64_t submitSequence, void* meta,
@@ -22,7 +45,7 @@ __global__ void enqueueTaskKernel(int opType, size_t tensorSize,
                                   const bool* activeRanks,
                                   int* activeRanksTensor, size_t taskId) {
     // Copy task into slot
-    tasks[taskId].opType = opType;
+    tasks[taskId].op = static_cast<CollectiveOp>(opType);
     tasks[taskId].tensorSize = tensorSize;
     tasks[taskId].broadcastRoot = broadcastRoot;
     tasks[taskId].bufferOffset = bufferOffset;
@@ -37,8 +60,10 @@ __global__ void enqueueTaskKernel(int opType, size_t tensorSize,
     while (tasks[taskId].active) {
         __threadfence_system();
     }
-    for (int i = 0; i < numRanks; ++i) {
-        activeRanksTensor[i] = activeRanks[i] ? 1 : 0;
+    if (activeRanksTensor != nullptr) {
+        for (int i = 0; i < numRanks; ++i) {
+            activeRanksTensor[i] = activeRanks[i] ? 1 : 0;
+        }
     }
 }
 
@@ -50,13 +75,9 @@ __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
     size_t stride = blockDim.x * gridDim.x;
 
 #ifdef __MUSA__
-    // mt_bfloat16 lacks arithmetic and comparison operators; use float
-    // accumulator and fminf/fmaxf for that type only.  Other types
-    // (float, double, int64_t, etc.) use their native accumulator to
-    // preserve full precision.
     constexpr bool kIsBf16 = std::is_same_v<scalar_t, mt_bfloat16>;
 #else
-    constexpr bool kIsBf16 = false;
+    constexpr bool kIsBf16 = std::is_same_v<scalar_t, __nv_bfloat16>;
 #endif
     using acc_t = std::conditional_t<kIsBf16, float, scalar_t>;
 
@@ -68,14 +89,16 @@ __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
             if (activeRanks[rank]) {
                 if (!valid) {
                     if constexpr (kIsBf16) {
-                        acc = (float)src[rank * numElements + elem_idx];
+                        acc = bfloat16ToFloat(
+                            src[rank * numElements + elem_idx]);
                     } else {
                         acc = src[rank * numElements + elem_idx];
                     }
                     valid = true;
                 } else {
                     if constexpr (kIsBf16) {
-                        float val = (float)src[rank * numElements + elem_idx];
+                        float val = bfloat16ToFloat(
+                            src[rank * numElements + elem_idx]);
                         switch (op) {
                             case 0:  // SUM
                                 acc += val;
@@ -116,7 +139,7 @@ __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
             }
         }
         if constexpr (kIsBf16) {
-            dst[elem_idx] = (scalar_t)acc;
+            dst[elem_idx] = floatToBfloat16(acc);
         } else {
             dst[elem_idx] = acc;
         }
@@ -174,9 +197,9 @@ void launchReduceKernel_bf16(void* dst, const void* src, size_t numElements,
                                          (const mt_bfloat16*)src, numElements,
                                          numRanks, op, activeRanks);
 #else
-    reduceKernel<<<64, 256, 0, stream>>>((at::BFloat16*)dst,
-                                         (const at::BFloat16*)src, numElements,
-                                         numRanks, op, activeRanks);
+    reduceKernel<<<64, 256, 0, stream>>>(
+        (__nv_bfloat16*)dst, (const __nv_bfloat16*)src, numElements, numRanks,
+        op, activeRanks);
 #endif
 }
 
@@ -189,8 +212,8 @@ void preloadReduceKernels() {
     auto preload = [](const char* name, auto kernel_ptr) {
         cudaFuncAttributes attr{};
         auto err = cudaFuncGetAttributes(&attr, kernel_ptr);
-        TORCH_CHECK(err == cudaSuccess, "Failed to preload kernel ", name, ": ",
-                    cudaGetErrorString(err));
+        MOONCAKE_CORE_CHECK(err == cudaSuccess, "Failed to preload kernel ",
+                            name, ": ", cudaGetErrorString(err));
     };
     preload("reduceKernel<uint8_t>",
             reinterpret_cast<const void*>(reduceKernel<uint8_t>));
@@ -209,7 +232,7 @@ void preloadReduceKernels() {
     preload("reduceKernel<bool>",
             reinterpret_cast<const void*>(reduceKernel<bool>));
     preload("reduceKernel<BFloat16>",
-            reinterpret_cast<const void*>(reduceKernel<at::BFloat16>));
+            reinterpret_cast<const void*>(reduceKernel<__nv_bfloat16>));
 #endif
 }
 

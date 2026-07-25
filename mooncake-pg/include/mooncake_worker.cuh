@@ -15,6 +15,8 @@
 #endif
 
 #include <cuda_alike.h>
+#include <collective_core_types.h>
+#include <pg_core_types.h>
 #include <transfer_engine.h>
 
 #include <memory>
@@ -26,50 +28,13 @@
 
 namespace mooncake {
 
-static constexpr size_t kBufferSize = 1u << 24;
-static constexpr size_t kMaxNumRanks = 64;
-
-struct SegmentInfo {
-    uint64_t send_buffer[2], recv_buffer[2], send_sync[2], recv_sync[2],
-        warmup_buffer[2];
-    uint64_t p2p_credit_region;
-    uint64_t p2p_ack_region;
-};
-
-struct TransferGroupMeta {
-    int rank;
-    int size;        // capacity: number of slots allocated (incl. inactive)
-    int activeSize;  // visible group size: number of ranks that participate
-    int taskCount;
-    bool* activeRanks;
-    bool* activeRanksDevice;
+struct TransferGroupMeta : P2PConnectionMetadata {
 #if !defined(__MUSA__)
     at::Tensor activeRanksTensor;
 #endif
-    bool peerConnected[kMaxNumRanks]{};
-    TransferEngine* engine;
 #if !defined(__MUSA__)
     c10::intrusive_ptr<::c10d::Store> store;
 #endif
-    int bufferBaseIndex;
-    int backendIndex;
-    TransferMetadata::SegmentID segmentIDs[kMaxNumRanks];
-    SegmentInfo segmentInfos[kMaxNumRanks];
-};
-
-#if defined(__CUDACC__) || defined(__MUSA__)
-__global__
-#endif
-    struct Task {
-    volatile bool active = false;
-    int opType =
-        0;  // c10d::OpType as int, for ABI compatibility with kernel code
-    size_t tensorSize;  // In bytes
-    int64_t broadcastRoot;
-    int bufferOffset;
-    uint64_t submitSequence = 0;
-    BatchID batchID;
-    void* transferGroupMeta;
 };
 
 #if !defined(__MUSA__)

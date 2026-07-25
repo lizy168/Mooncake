@@ -3,6 +3,7 @@
 // from mooncake_worker_kernels.cuh instead of <<<>>> syntax.
 
 #include <mooncake_backend.h>
+#include <collective_reduce.h>
 #include <cstdio>
 #include <memory>
 #include <thread>
@@ -13,6 +14,53 @@
 #include "pg_utils.h"
 
 namespace mooncake {
+
+namespace {
+
+ScalarType toCoreScalarType(at::ScalarType dtype) {
+    switch (dtype) {
+        case c10::kByte: return ScalarType::kUInt8;
+        case c10::kChar: return ScalarType::kInt8;
+        case c10::kShort: return ScalarType::kInt16;
+        case c10::kInt: return ScalarType::kInt32;
+        case c10::kLong: return ScalarType::kInt64;
+        case c10::kFloat: return ScalarType::kFloat32;
+        case c10::kDouble: return ScalarType::kFloat64;
+        case c10::kBool: return ScalarType::kBool;
+        case c10::kBFloat16: return ScalarType::kBFloat16;
+        default: TORCH_CHECK(false, "Unsupported reduce dtype: ", dtype);
+    }
+}
+
+ReduceOp toCoreReduceOp(c10d::ReduceOp op) {
+    switch (op) {
+        case c10d::ReduceOp::SUM: return ReduceOp::kSum;
+        case c10d::ReduceOp::PRODUCT: return ReduceOp::kProduct;
+        case c10d::ReduceOp::MIN: return ReduceOp::kMin;
+        case c10d::ReduceOp::MAX: return ReduceOp::kMax;
+        default: TORCH_CHECK(false, "Unsupported reduce op: ", op);
+    }
+}
+
+CollectiveOp toCoreCollectiveOp(c10d::OpType op) {
+    switch (op) {
+        case c10d::OpType::BROADCAST: return CollectiveOp::kBroadcast;
+        case c10d::OpType::ALLREDUCE: return CollectiveOp::kAllReduce;
+        case c10d::OpType::ALLGATHER:
+        case c10d::OpType::_ALLGATHER_BASE: return CollectiveOp::kAllGather;
+        case c10d::OpType::_REDUCE_SCATTER_BASE:
+            return CollectiveOp::kReduceScatter;
+        case c10d::OpType::ALLTOALL:
+        case c10d::OpType::ALLTOALL_BASE: return CollectiveOp::kAllToAll;
+        case c10d::OpType::REDUCE: return CollectiveOp::kReduce;
+        case c10d::OpType::GATHER: return CollectiveOp::kGather;
+        case c10d::OpType::SCATTER: return CollectiveOp::kScatter;
+        case c10d::OpType::BARRIER: return CollectiveOp::kBarrier;
+        default: TORCH_CHECK(false, "Unsupported collective op: ", op);
+    }
+}
+
+}  // namespace
 
 class MooncakeWorkCpu : public ::c10d::Work {
    public:
@@ -214,84 +262,11 @@ void launchReduceKernel(at::Tensor dst, size_t pos, size_t realSize, void* src,
     }
 }
 
-template <typename T>
-T applyReduceOp(const T& a, const T& b, c10d::ReduceOp op) {
-    switch (op) {
-        case c10d::ReduceOp::SUM:
-            return a + b;
-        case c10d::ReduceOp::PRODUCT:
-            return a * b;
-        case c10d::ReduceOp::MIN:
-            return std::min(a, b);
-        case c10d::ReduceOp::MAX:
-            return std::max(a, b);
-        default:
-            TORCH_CHECK(false, c10::str("Unsupported reduce op: ", op));
-    }
-}
-
-template <typename T>
-void reduceCpu(T* dst, const T* src, size_t numElements, size_t numRanks,
-               c10d::ReduceOp op, bool* activeRanks) {
-    at::parallel_for(0, numElements, 1024, [&](int64_t begin, int64_t end) {
-        for (int64_t i = begin; i < end; ++i) {
-            bool valid = false;
-            T acc{};
-            for (int64_t rank = 0; rank < numRanks; ++rank) {
-                if (activeRanks[rank]) {
-                    if (!valid) {
-                        acc = src[i + rank * numElements];
-                        valid = true;
-                    } else {
-                        acc =
-                            applyReduceOp(acc, src[i + rank * numElements], op);
-                    }
-                }
-            }
-            dst[i] = acc;
-        }
-    });
-}
-
 void launchReduceCpu(at::Tensor dst, size_t pos, size_t realSize, void* src,
                      size_t numRanks, c10d::ReduceOp op, bool* activeRanks) {
-    auto ptr = (char*)dst.data_ptr() + pos;
-    size_t num = realSize / dst.element_size();
-
-    switch (dst.scalar_type()) {
-        case c10::kByte:
-            reduceCpu((uint8_t*)ptr, (uint8_t*)src, num, numRanks, op,
-                      activeRanks);
-            break;
-        case c10::kChar:
-            reduceCpu((int8_t*)ptr, (int8_t*)src, num, numRanks, op,
-                      activeRanks);
-            break;
-        case c10::kShort:
-            reduceCpu((int16_t*)ptr, (int16_t*)src, num, numRanks, op,
-                      activeRanks);
-            break;
-        case c10::kInt:
-            reduceCpu((int*)ptr, (int*)src, num, numRanks, op, activeRanks);
-            break;
-        case c10::kLong:
-            reduceCpu((int64_t*)ptr, (int64_t*)src, num, numRanks, op,
-                      activeRanks);
-            break;
-        case c10::kFloat:
-            reduceCpu((float*)ptr, (float*)src, num, numRanks, op, activeRanks);
-            break;
-        case c10::kDouble:
-            reduceCpu((double*)ptr, (double*)src, num, numRanks, op,
-                      activeRanks);
-            break;
-        case c10::kBool:
-            reduceCpu((bool*)ptr, (bool*)src, num, numRanks, op, activeRanks);
-            break;
-        default:
-            TORCH_CHECK(false, c10::str("Unsupported reduce dtype: ",
-                                        dst.scalar_type()));
-    }
+    reduceRawCpu(static_cast<char*>(dst.data_ptr()) + pos, src, realSize,
+                 toCoreScalarType(dst.scalar_type()), numRanks,
+                 toCoreReduceOp(op), activeRanks);
 }
 
 MooncakeWorker::MooncakeWorker(int cuda_device_index)
@@ -359,7 +334,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
         size_t realSize = std::min(chunkSize, tensorSize - state->currentPos);
         int bufferOffset = meta->taskCount % 2;
 
-        tasks_[taskId].opType = (int)opType;
+        tasks_[taskId].op = toCoreCollectiveOp(opType);
         tasks_[taskId].tensorSize = realSize;
         tasks_[taskId].broadcastRoot = broadcastRoot;
         tasks_[taskId].bufferOffset = bufferOffset;
@@ -433,7 +408,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
 
         hasCallback_[taskId] = false;
         launchEnqueueTaskKernel(
-            (int)opType, realSize, broadcastRoot, bufferOffset, taskSequence,
+            static_cast<int>(toCoreCollectiveOp(opType)), realSize,
+            broadcastRoot, bufferOffset, taskSequence,
             meta.get(), tasks_device_, meta->size, meta->activeRanksDevice,
             meta->activeRanksTensor.data_ptr<int>(), taskId,
             enq_stream.stream());
